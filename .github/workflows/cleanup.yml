@@ -24,9 +24,11 @@ jobs:
       - run: pip install requests==2.32.3
       - name: Run cleanup
         env:
-          ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
-          ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
-          ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+          # Either set of secret names works.
+          ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID || secrets.ZOHO_BOOKS_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET || secrets.ZOHO_BOOKS_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN || secrets.ZOHO_BOOKS_REFRESH_TOKEN }}
+          ZOHO_PRODUCT: books
           ZOHO_DC: us
           # Scheduled runs delete; manual runs default to dry run.
           DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
