@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Delete 1NCE "Orderconfirmation.pdf" files from Zoho Inventory > Documents > Inbox
-for Go Fleet Corporation (org 673162904). Nothing else is touched.
+Delete 1NCE "Orderconfirmation.pdf" files from the Documents Inbox of
+Go Fleet Corporation (org 673162904). Nothing else is touched.
+
+Zoho Books and Zoho Inventory share the same Documents for this org, so
+deleting through either API removes the file from both. Books is the default.
 
 A file is deleted only if ALL of these are true:
   - it is in the Documents Inbox
@@ -18,6 +21,8 @@ How it stays fast and under Zoho's ~100 calls/minute limit:
 
 Non-interactive, so it runs in GitHub Actions. Settings via environment:
   ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN   (required)
+                     ZOHO_BOOKS_CLIENT_ID / _CLIENT_SECRET / _REFRESH_TOKEN also work
+  ZOHO_PRODUCT       books (default) or inventory - which API to use
   ZOHO_DC            us (default), eu, in, au, jp, ca, sa, cn
   DRY_RUN            "true" (default) = scan and report only; "false" = delete
   MAX_DELETE         optional cap per run, 0 = no cap
@@ -58,7 +63,14 @@ ACCOUNTS_HOSTS = {
     "sa": "https://accounts.zoho.sa", "cn": "https://accounts.zoho.com.cn",
 }
 DATA_CENTRE = os.getenv("ZOHO_DC", "us")
-API_PATH = "/inventory/v1"
+PRODUCT = os.getenv("ZOHO_PRODUCT", "books").strip().lower()
+API_PATH = {"books": "/books/v3", "inventory": "/inventory/v1"}.get(PRODUCT)
+SCOPE_HINT = {"books": "ZohoBooks.fullaccess.all", "inventory": "ZohoInventory.FullAccess.all"}.get(PRODUCT)
+
+
+def env(name):
+    """Read ZOHO_X, falling back to ZOHO_BOOKS_X (the names the old script used)."""
+    return os.getenv(f"ZOHO_{name}") or os.getenv(f"ZOHO_BOOKS_{name}") or ""
 
 
 def norm(value):
@@ -107,9 +119,11 @@ class Pacer:
 
 class Zoho:
     def __init__(self):
-        self.client_id = os.environ["ZOHO_CLIENT_ID"]
-        self.client_secret = os.environ["ZOHO_CLIENT_SECRET"]
-        self.refresh_token = os.environ["ZOHO_REFRESH_TOKEN"]
+        self.client_id = env("CLIENT_ID")
+        self.client_secret = env("CLIENT_SECRET")
+        self.refresh_token = env("REFRESH_TOKEN")
+        self.inbox_param = True      # False if this API doesn't accept view=inbox
+        self.no_sender_field = 0     # name matched but Zoho gave no sender
         self.accounts_host = ACCOUNTS_HOSTS[DATA_CENTRE]
         self.api_host = "https://www.zohoapis.com"
         self.session = requests.Session()
@@ -156,9 +170,9 @@ class Zoho:
                 auth_failures += 1
                 if auth_failures >= 2:
                     sys.exit(f"Zoho refused the credentials for {method} {path} ({last}).\n"
-                             "Usually the refresh token was made without the ZohoInventory scope "
-                             "(e.g. a Zoho Books token), or for a different Zoho account / data centre. "
-                             "Create a new one with scope ZohoInventory.FullAccess.all.")
+                             f"Usually the refresh token lacks the scope {SCOPE_HINT}, "
+                             "or belongs to a different Zoho account / data centre. "
+                             f"Create a new one with scope {SCOPE_HINT}.")
                 self.token = None
                 continue
             if is_rate_limited(r.status_code, text):
@@ -186,11 +200,17 @@ class Zoho:
         return name
 
     def list_page(self, page):
-        r = self.request("GET", "/documents", {
-            "view": "inbox", "search_text": SEARCH_TEXT, "sort_column": "created_time",
-            "page": page, "per_page": PER_PAGE,
-        })
-        b = self.body(r)
+        params = {"search_text": SEARCH_TEXT, "sort_column": "created_time",
+                  "page": page, "per_page": PER_PAGE}
+        if self.inbox_param:
+            params["view"] = "inbox"
+        b = self.body(self.request("GET", "/documents", params))
+        if b.get("code") != 0 and self.inbox_param and page == 1 and "view" in str(b.get("message", "")).lower():
+            # This API doesn't take view=inbox: list without it and keep only
+            # files that are not in any folder (that is what the Inbox is).
+            print("Note: API has no Inbox filter; keeping only files not in a folder.")
+            self.inbox_param = False
+            return self.list_page(page)
         if b.get("code") != 0:
             sys.exit(f"Listing page {page} failed: {b.get('message')}. Nothing deleted.")
         return b.get("documents", []), bool(b.get("page_context", {}).get("has_more_page"))
@@ -221,8 +241,14 @@ def scan(zoho):
             if did in seen:
                 continue
             seen.add(did)
-            if norm(d.get("file_name")) != TARGET_FILENAME or norm(d.get("from_address")) != SENDER:
+            if norm(d.get("file_name")) != TARGET_FILENAME:
                 continue
+            if norm(d.get("from_address")) != SENDER:
+                if "from_address" not in d:
+                    zoho.no_sender_field += 1
+                continue
+            if not zoho.inbox_param and norm(d.get("folder_id")):
+                continue             # in a folder, not the Inbox
             if is_attached(d):
                 skipped += 1
             else:
@@ -291,15 +317,17 @@ def delete_all(zoho, ids, log):
 
 
 def main():
-    for var in ("ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN"):
-        if not os.getenv(var):
-            sys.exit(f"Missing environment variable {var}.")
+    for var in ("CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"):
+        if not env(var):
+            sys.exit(f"Missing environment variable ZOHO_{var}.")
+    if not API_PATH:
+        sys.exit("ZOHO_PRODUCT must be 'books' or 'inventory'.")
     if DATA_CENTRE not in ACCOUNTS_HOSTS:
         sys.exit(f"ZOHO_DC must be one of: {', '.join(ACCOUNTS_HOSTS)}")
 
     zoho = Zoho()
     org = zoho.verify_org()
-    print(f"Organisation : {org} ({ORG_ID})")
+    print(f"Organisation : {org} ({ORG_ID}) via Zoho {PRODUCT.title()} API")
     print(f"Deleting     : Inbox files named '{TARGET_FILENAME}' from {SENDER}, not attached")
     print(f"Mode         : {'DRY RUN' if DRY_RUN else 'DELETE'}")
 
@@ -309,6 +337,9 @@ def main():
     except DailyLimitHit as e:
         sys.exit(f"Zoho's daily API limit was reached during the scan ({e}). Try again tomorrow.")
     print(f"Scan done: {len(ids)} to delete, {skipped} attached to transactions (kept).")
+    if zoho.no_sender_field:
+        print(f"WARNING: {zoho.no_sender_field} files named '{TARGET_FILENAME}' had no sender in "
+              f"Zoho's data, so they were NOT selected. Try ZOHO_PRODUCT=inventory.")
     if MAX_DELETE:
         ids = ids[:MAX_DELETE]
     if not ids:
