@@ -131,22 +131,34 @@ class Zoho:
         self.expiry = time.time() + int(body.get("expires_in", 3600))
         if body.get("api_domain"):
             self.api_host = body["api_domain"].rstrip("/")
+        if self.calls == 0:
+            print(f"Logged in. API host: {self.api_host}, token scope: {body.get('scope', 'not reported')}")
         return self.token
 
     def request(self, method, path, params=None):
         params = dict(params or {}, organization_id=ORG_ID)
+        auth_failures = 0
+        last = "no response"
         for attempt in range(1, 8):
             self.pacer.wait()
             headers = {"Authorization": f"Zoho-oauthtoken {self.access_token()}"}
             try:
                 r = self.session.request(method, f"{self.api_host}{API_PATH}{path}",
                                          headers=headers, params=params, timeout=60)
-            except requests.RequestException:
+            except requests.RequestException as e:
+                last = f"network error: {e}"
                 time.sleep(2 ** attempt)
                 continue
             self.calls += 1
             text = r.text[:500]
+            last = f"HTTP {r.status_code}: {text[:300]}"
             if r.status_code == 401:
+                auth_failures += 1
+                if auth_failures >= 2:
+                    sys.exit(f"Zoho refused the credentials for {method} {path} ({last}).\n"
+                             "Usually the refresh token was made without the ZohoInventory scope "
+                             "(e.g. a Zoho Books token), or for a different Zoho account / data centre. "
+                             "Create a new one with scope ZohoInventory.FullAccess.all.")
                 self.token = None
                 continue
             if is_rate_limited(r.status_code, text):
@@ -156,7 +168,7 @@ class Zoho:
                 time.sleep(RATE_LIMIT_WAIT)
                 continue
             return r
-        sys.exit(f"Giving up on {method} {path}: repeated rate limits or errors.")
+        sys.exit(f"Giving up on {method} {path} after 7 attempts. Last response: {last}")
 
     @staticmethod
     def body(r):
